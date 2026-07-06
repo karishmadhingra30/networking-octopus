@@ -49,11 +49,25 @@ account — so the Sheet stays on your account and no sharing is needed.
 1. Go to the [Google Cloud Console](https://console.cloud.google.com/) and
    create a project (or reuse one).
 2. Enable the **Google Sheets API** (and **Google Drive API**) for the project.
-3. Configure the **OAuth consent screen**: choose **External**, and add your own
-   Google email as a **test user**.
-4. Create credentials → **OAuth client ID** → application type **Desktop app**.
-5. **Download the client JSON** and save it in the project root as
-   `client_secret.json` (or point `GOOGLE_OAUTH_CLIENT_SECRETS` at its path).
+3. Go straight to it: console.cloud.google.com/auth/overview
+         
+         Confirm your project is selected in the top bar first.
+         2. Click "Get started" (this is the wizard that replaced the user-type page). It asks for:
+         
+         App Information → app name (anything) + user support email (your email) → Next
+         Audience → choose External ← this is where the External/Internal choice lives now → Next
+         Contact Information → your email → Next
+         Agree to the policy → Create
+         3. Add yourself as a test user:
+         
+         Left nav → Audience
+         Scroll to Test users → Add users → add your own Gmail → Save
+         4. Create the OAuth client:
+         
+         Left nav → Clients → Create client
+         Application type: Desktop app → Create
+         Download the JSON.
+         Then rename it to client_secret.json, drop it in the repo root
 
 On your first `agent init` / `agent run`, a browser window opens for you to
 authenticate. The resulting token is cached at `GOOGLE_TOKEN_CACHE`
