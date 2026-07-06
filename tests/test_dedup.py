@@ -15,6 +15,14 @@ def test_normalize_strips_scheme_www_query_and_trailing_slash():
     assert keys == {"linkedin.com/in/jane-doe"}
 
 
+def test_normalize_collapses_country_subdomains():
+    # Bright Data returns localized hosts (co./in./uk.) in the record's `url`;
+    # these must dedupe against the clean www URL we searched with.
+    assert normalize_url("https://co.linkedin.com/in/tammysun1") == "linkedin.com/in/tammysun1"
+    assert normalize_url("https://www.linkedin.com/in/tammysun1") == "linkedin.com/in/tammysun1"
+    assert normalize_url("https://in.linkedin.com/in/foo/") == "linkedin.com/in/foo"
+
+
 def test_normalize_handles_empty():
     assert normalize_url("") == ""
     assert normalize_url(None) == ""

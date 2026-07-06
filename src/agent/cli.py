@@ -158,6 +158,34 @@ def run(
         typer.secho("Done.", fg=typer.colors.GREEN)
 
 
+# ---------------------------------------------------------------- test-serp
+@app.command("test-serp")
+def test_serp(
+    query: str = typer.Argument(..., help="Raw Google query to send, e.g. 'site:linkedin.com/in/ founder fertility'."),
+) -> None:
+    """Fire ONE SERP request and print the JSON keys + extracted profile URLs."""
+    config = _load_config_or_exit()
+    client = BrightDataClient(config)
+    try:
+        raw, urls = client.serp_probe(query)
+    except DiscoveryError as exc:
+        typer.secho(f"SERP error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    top_keys = list(raw.keys()) if isinstance(raw, dict) else f"(type {type(raw).__name__})"
+    typer.echo(f"top-level JSON keys: {top_keys}")
+    organic = raw.get("organic") if isinstance(raw, dict) else None
+    if isinstance(organic, list):
+        typer.echo(f"organic results: {len(organic)}")
+        if organic:
+            typer.echo(f"first organic item keys: {list(organic[0].keys())}")
+    else:
+        typer.secho("  no 'organic' array found — parser may need adjusting", fg=typer.colors.YELLOW)
+    typer.secho(f"\nextracted {len(urls)} LinkedIn profile URLs:", fg=typer.colors.GREEN)
+    for u in urls[:15]:
+        typer.echo(f"  {u}")
+
+
 # -------------------------------------------------------------------- learn
 @app.command()
 def learn() -> None:

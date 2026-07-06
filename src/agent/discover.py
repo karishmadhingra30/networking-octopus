@@ -48,6 +48,9 @@ SERP_PAGE_SIZE = 20      # results requested per SERP page
 MAX_SERP_PAGES = 12      # safety cap on pagination
 REQUEST_TIMEOUT = 300    # seconds for a sync scrape chunk
 
+RETRY_STATUSES = {400, 429, 500, 502, 503, 504}  # Bright Data can 400 transiently on cold scrapes
+RETRY_ATTEMPTS = 3
+
 
 class DiscoveryError(RuntimeError):
     pass
@@ -119,6 +122,35 @@ class BrightDataClient:
         print(f"[discover] retrieved {len(records)} records -> {len(candidates)} usable candidates")
         return candidates[:pool_size]
 
+    # ---------------------------------------------------------- http w/ retry
+    def _post(self, url: str, *, params: dict | None, payload: dict, timeout: int) -> requests.Response:
+        """POST with retry on transient statuses; raises DiscoveryError on hard failure."""
+        last: requests.Response | None = None
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+            resp = self._session.post(url, params=params, json=payload, timeout=timeout)
+            if resp.status_code < 400:
+                return resp
+            last = resp
+            if resp.status_code not in RETRY_STATUSES or attempt == RETRY_ATTEMPTS:
+                break
+            wait = 2 ** attempt
+            print(f"[http] {resp.status_code} from {url.rsplit('/', 1)[-1]}; retry {attempt}/{RETRY_ATTEMPTS - 1} in {wait}s")
+            time.sleep(wait)
+        body = last.text[:300] if last is not None else "(no response)"
+        code = last.status_code if last is not None else "?"
+        raise DiscoveryError(f"Bright Data request to {url} failed ({code}): {body}")
+
+    # ------------------------------------------------------------- serp probe
+    def serp_probe(self, query: str) -> tuple[dict[str, Any], list[str]]:
+        """Run one SERP page and return (raw json, extracted profile urls).
+
+        Used by `agent test-serp` to verify the response shape cheaply.
+        """
+        if not self._serp_zone:
+            raise DiscoveryError("BRIGHTDATA_SERP_ZONE is not set.")
+        raw = self._serp_page(query, 0)
+        return raw, _extract_profile_urls(raw)
+
     # ---------------------------------------------------------- SERP (stage 1)
     def _serp_collect_profile_urls(self, query: str, pool_size: int) -> list[str]:
         collected: list[str] = []
@@ -146,10 +178,7 @@ class BrightDataClient:
             f"q={quote_plus(query)}&num={SERP_PAGE_SIZE}&start={start}&brd_json=1"
         )
         payload = {"zone": self._serp_zone, "url": google_url, "format": "raw"}
-        resp = self._session.post(REQUEST_URL, json=payload, timeout=90)
-        if resp.status_code == 401:
-            raise DiscoveryError("Bright Data SERP request rejected (401). Check token / SERP zone.")
-        resp.raise_for_status()
+        resp = self._post(REQUEST_URL, params=None, payload=payload, timeout=90)
         # With brd_json=1 the body is Bright Data's parsed SERP JSON.
         try:
             return resp.json()
@@ -172,23 +201,17 @@ class BrightDataClient:
                 "input": [{"url": u} for u in chunk],
                 "limit_per_input": None,
             }
-            resp = self._session.post(
+            resp = self._post(
                 SCRAPE_URL,
                 params={
                     "dataset_id": self._dataset_id,
                     "notify": "false",
                     "include_errors": "true",
                 },
-                json=payload,
+                payload=payload,
                 timeout=REQUEST_TIMEOUT,
             )
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, dict):
-                # Some responses wrap rows under a key; be permissive.
-                data = data.get("data") or data.get("records") or []
-            if isinstance(data, list):
-                out.extend(r for r in data if isinstance(r, dict))
+            out.extend(_parse_scrape_response(resp))
             if len(urls) > SCRAPE_CHUNK:
                 print(f"[scrape] {min(i + SCRAPE_CHUNK, len(urls))}/{len(urls)} profiles done")
                 time.sleep(1)  # be gentle between chunks
@@ -209,6 +232,47 @@ class BrightDataClient:
                 f"Estimated cost ${estimate:.4f} exceeds ceiling "
                 f"${self._config.cost_ceiling_usd:.2f}. Lower POOL_SIZE or raise COST_CEILING_USD."
             )
+
+
+# --- Scrape response parsing ------------------------------------------------
+def _parse_scrape_response(resp: requests.Response) -> list[dict[str, Any]]:
+    """Extract profile records from a /scrape response.
+
+    The sync endpoint returns one of: a single record dict (one input), a JSON
+    array of records, a wrapper dict ({"data": [...]}), or NDJSON.
+    """
+    try:
+        data: Any = resp.json()
+    except json.JSONDecodeError:
+        # NDJSON fallback (one JSON object per line).
+        rows = []
+        for line in resp.text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        data = rows
+
+    if isinstance(data, dict):
+        for key in ("data", "records", "results"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+        else:
+            data = [data]  # a single record dict, not a wrapper
+
+    if not isinstance(data, list):
+        return []
+    # Drop Bright Data error stubs (records that carry no usable identity).
+    return [
+        r
+        for r in data
+        if isinstance(r, dict)
+        and (r.get("input_url") or r.get("url") or r.get("name") or r.get("id"))
+    ]
 
 
 # --- Google query construction ---------------------------------------------
@@ -261,7 +325,9 @@ def _record_to_candidate(record: dict[str, Any]) -> Candidate:
 
     return Candidate(
         name=_first(record, "name", "full_name", "fullName"),
-        profile_url=_first(record, "url", "input_url", "profile_url", "linkedin_url"),
+        # Prefer input_url (the clean www.linkedin.com URL we requested) over `url`,
+        # which Bright Data returns with a localized subdomain (e.g. co.linkedin.com).
+        profile_url=_first(record, "input_url", "url", "profile_url", "linkedin_url"),
         headline=_first(record, "position", "headline", "current_position", "title"),
         company=_first(
             record, "current_company_name", "current_company", "company", "company_name"

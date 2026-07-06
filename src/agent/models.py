@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
+
+# Matches a leading country-code subdomain on linkedin.com, e.g. "co.linkedin.com",
+# "in.linkedin.com", "uk.linkedin.com" — Bright Data returns these in `url`.
+_CC_SUBDOMAIN_RE = re.compile(r"^[a-z]{2,3}\.linkedin\.com")
 
 
 def normalize_url(url: str | None) -> str:
@@ -24,6 +29,9 @@ def normalize_url(url: str | None) -> str:
             break
     if u.startswith("www."):
         u = u[4:]
+    # Collapse localized LinkedIn subdomains (co./in./uk./...) to the canonical host
+    # so the same profile always dedupes to one key.
+    u = _CC_SUBDOMAIN_RE.sub("linkedin.com", u)
     return u.rstrip("/")
 
 
