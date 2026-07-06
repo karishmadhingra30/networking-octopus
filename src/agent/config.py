@@ -34,6 +34,7 @@ class Config:
     # Bright Data
     brightdata_api_token: str
     brightdata_profile_dataset_id: str
+    brightdata_serp_zone: str
 
     # Google Sheets
     google_oauth_client_secrets: str
@@ -86,6 +87,8 @@ def load_config(env_file: str | None = None) -> Config:
         model_draft=os.environ.get("MODEL_DRAFT", "claude-opus-4-8").strip(),
         brightdata_api_token=_require("BRIGHTDATA_API_TOKEN"),
         brightdata_profile_dataset_id=_require("BRIGHTDATA_PROFILE_DATASET_ID"),
+        # Optional at load time; discovery raises a clear error if it's unset.
+        brightdata_serp_zone=os.environ.get("BRIGHTDATA_SERP_ZONE", "").strip(),
         google_oauth_client_secrets=os.environ.get(
             "GOOGLE_OAUTH_CLIENT_SECRETS", "./client_secret.json"
         ).strip(),

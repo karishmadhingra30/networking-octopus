@@ -5,8 +5,12 @@ people you want to network with. The agent:
 
 1. **Enriches** your prompt into structured discovery filters (Claude), and
    confirms them with you in the terminal.
-2. **Discovers** matching LinkedIn profiles via the Bright Data LinkedIn Scraper
-   API (async discovery, no login, public data only).
+2. **Discovers** matching LinkedIn profiles in two stages via Bright Data
+   (no login, public data only): a **SERP** search
+   (`site:linkedin.com/in/ "<title>" <keywords> <location>`) harvests profile
+   URLs, then the **people-profiles** dataset scrapes those URLs into full
+   records. (Bright Data's LinkedIn "people search" only matches exact names, so
+   SERP is what enables title/keyword/location prospecting.)
 3. **Dedupes** against profiles already in your Google Sheet.
 4. **Ranks** the candidates for relevance (Claude).
 5. **Drafts** a personalized outreach message for each selected profile (Claude),
@@ -75,16 +79,18 @@ authenticate. The resulting token is cached at `GOOGLE_TOKEN_CACHE`
 
 ## 4. Bright Data setup
 
-1. In the Bright Data dashboard, get your **API token** (Account settings).
-2. Setup SERP API and #TODO
-3. Note the free tier: **5,000 records/month**.
+Discovery needs **two** Bright Data pieces, both driven by the same account API
+token:
 
-> **Before your first real discovery run**, confirm the discovery request shape
-> for the LinkedIn profiles dataset against
-> [docs.brightdata.com](https://docs.brightdata.com). The trigger/poll/retrieve
-> flow in `src/agent/discover.py` is stable; the `discover_by` value and the
-> discovery request **body** field names are marked with `TODO(brightdata)` and
-> are the only place you may need to adjust to match the current dataset schema.
+1. **API token** — Account settings → API keys. Put it in `BRIGHTDATA_API_TOKEN`.
+2. **LinkedIn people-profiles dataset** — Scrapers → LinkedIn → People profiles.
+   Copy its dataset id (e.g. `gd_l1viktl72bvl7bjuj0`) into
+   `BRIGHTDATA_PROFILE_DATASET_ID`. Used to scrape profile URLs into records.
+3. **SERP API zone** — Web Access → **Add API → SERP API**. Create the zone and
+   copy its **zone name** into `BRIGHTDATA_SERP_ZONE`. Used to Google-search
+   `site:linkedin.com/in/ ...` and harvest profile URLs (stage 1 of discovery).
+
+Note the free tier: **5,000 records/month** on the profiles dataset.
 
 ## 5. Anthropic setup
 
@@ -149,11 +155,12 @@ are inspectable and reversible (it prints a diff of what changed). The next
 
 ## 10. Cost note
 
-Discovery is billed per profile record at ~$0.0015/record. A pool of 40 profiles
-is roughly **$0.06 per run** — well within the Bright Data free tier at 1–2 runs
+Discovery is billed per profile record at ~$0.0015/record, plus a handful of
+SERP requests (~$0.0015 each) to harvest the URLs. A pool of 40 profiles is
+roughly **$0.06 per run** — well within the Bright Data free tier at 1–2 runs
 per week. Claude usage per run is a handful of small calls. The agent prints a
-cost estimate before triggering discovery and **refuses to run** if the estimate
-exceeds `COST_CEILING_USD` (default $1.00).
+cost estimate before discovery and **refuses to run** if the estimate exceeds
+`COST_CEILING_USD` (default $1.00).
 
 ## Sheet schema
 

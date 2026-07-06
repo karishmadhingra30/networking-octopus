@@ -1,34 +1,52 @@
-"""Bright Data LinkedIn Scraper client — discovery + single-URL scrape.
+"""Bright Data client — two-stage discovery + profile scrape.
 
-Two paths:
-  * `scrape_profile(url)`     — sync single-URL collection (used to cache the
-                                operator's own profile for personalization).
-  * `discover(filters, ...)`  — async discovery: trigger -> poll -> retrieve.
+Bright Data's LinkedIn "people search" dataset only finds profiles by exact
+name, so it cannot do keyword/title/location prospecting. Instead we do the
+standard two-stage approach:
 
-NOTE (open item to confirm against live docs at docs.brightdata.com before a
-real run): the trigger/poll/retrieve *skeleton* below is stable, but the exact
-`discover_by` value and the discovery request **body** schema for the LinkedIn
-profiles dataset must be confirmed in the Bright Data dashboard/docs. The
-`_build_discovery_payload` function is the single place to adjust. See the
-TODO markers there.
+  Stage 1 (SERP): Google-search `site:linkedin.com/in/ "<title>" <keywords>
+                  <location>` via Bright Data's SERP API (the `/request`
+                  endpoint) and harvest the LinkedIn profile URLs from the
+                  organic results.
+  Stage 2 (scrape): feed those URLs to the LinkedIn *people profiles* dataset
+                    (collect-by-URL, `gd_l1viktl72bvl7bjuj0`) via the sync
+                    `/datasets/v3/scrape` endpoint to get full profile records.
+
+The operator's own profile is scraped the same way (stage 2 on a single URL)
+and cached by the CLI.
+
+Endpoint shapes confirmed against the Bright Data dashboard:
+  * scrape (sync):  POST /datasets/v3/scrape?dataset_id=<id>&include_errors=true
+                    body {"input": [{"url": ...}, ...], "limit_per_input": null}
+  * SERP (direct):  POST https://api.brightdata.com/request
+                    body {"zone": <serp_zone>, "url": <google url + brd_json=1>,
+                          "format": "raw"}
 """
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote_plus
 
 import requests
 
 from .config import Config
-from .models import Candidate
+from .models import Candidate, normalize_url
 
-BASE = "https://api.brightdata.com/datasets/v3"
-PROFILE_COST_PER_RECORD = 0.0015  # USD per profile record (profiles-only runs)
+DATASETS_BASE = "https://api.brightdata.com/datasets/v3"
+SCRAPE_URL = f"{DATASETS_BASE}/scrape"
+REQUEST_URL = "https://api.brightdata.com/request"
 
-POLL_INTERVAL_SECONDS = 5
-POLL_MAX_WAIT_SECONDS = 300
+PROFILE_COST_PER_RECORD = 0.0015  # USD per profile record scraped
+SERP_COST_PER_REQUEST = 0.0015    # USD per SERP request (approx; small)
+
+SCRAPE_CHUNK = 10        # profiles per sync /scrape call
+SERP_PAGE_SIZE = 20      # results requested per SERP page
+MAX_SERP_PAGES = 12      # safety cap on pagination
+REQUEST_TIMEOUT = 300    # seconds for a sync scrape chunk
 
 
 class DiscoveryError(RuntimeError):
@@ -50,6 +68,7 @@ class BrightDataClient:
     def __init__(self, config: Config):
         self._config = config
         self._dataset_id = config.brightdata_profile_dataset_id
+        self._serp_zone = config.brightdata_serp_zone
         self._session = requests.Session()
         self._session.headers.update(
             {
@@ -60,75 +79,130 @@ class BrightDataClient:
 
     # ------------------------------------------------------------------ auth
     def check_auth(self) -> None:
-        """Lightweight auth probe used by `agent init`.
-
-        Hits the datasets listing endpoint; raises on a non-2xx so credential
-        problems surface clearly at startup.
-        """
-        resp = self._session.get(f"{BASE}/datasets", timeout=30)
+        """Lightweight auth probe used by `agent init`."""
+        resp = self._session.get(f"{DATASETS_BASE}/datasets", timeout=30)
         if resp.status_code == 401:
             raise DiscoveryError("Bright Data token rejected (401). Check BRIGHTDATA_API_TOKEN.")
         resp.raise_for_status()
 
     # -------------------------------------------------- single-URL scrape
     def scrape_profile(self, profile_url: str) -> Candidate | None:
-        """Synchronously scrape a single profile by URL.
-
-        Used once for the operator's own profile. Triggers a non-discovery
-        collection job and polls for the single record.
-        """
-        trigger = self._session.post(
-            f"{BASE}/trigger",
-            params={"dataset_id": self._dataset_id, "format": "json"},
-            json=[{"url": profile_url}],
-            timeout=60,
-        )
-        trigger.raise_for_status()
-        snapshot_id = trigger.json().get("snapshot_id")
-        if not snapshot_id:
-            raise DiscoveryError(f"No snapshot_id in trigger response: {trigger.text[:300]}")
-
-        records = self._poll_and_retrieve(snapshot_id)
+        """Scrape a single profile by URL (used for the operator's own profile)."""
+        records = self._scrape_sync([profile_url])
         if not records:
             return None
         return _record_to_candidate(records[0])
 
-    # ----------------------------------------------------- async discovery
+    # ----------------------------------------------------- two-stage discovery
     def discover(self, filters: ConfirmedFilters, pool_size: int) -> list[Candidate]:
-        """Run discovery for the confirmed filters and return up to `pool_size`."""
+        """SERP-harvest profile URLs for the filters, then scrape them."""
+        if not self._serp_zone:
+            raise DiscoveryError(
+                "BRIGHTDATA_SERP_ZONE is not set. Create a SERP API zone in the "
+                "Bright Data dashboard (Web Access -> Add API -> SERP API) and put "
+                "its zone name in .env as BRIGHTDATA_SERP_ZONE."
+            )
         self._guard_cost(pool_size)
 
-        payload = _build_discovery_payload(filters, pool_size)
-        print(f"[discover] triggering Bright Data discovery (limit {pool_size})...")
-        trigger = self._session.post(
-            f"{BASE}/trigger",
-            params={
-                "dataset_id": self._dataset_id,
-                "type": "discover_new",
-                "discover_by": _DISCOVER_BY,  # TODO: confirm valid value (see below)
-                "format": "json",
-            },
-            json=payload,
-            timeout=60,
-        )
-        trigger.raise_for_status()
-        snapshot_id = trigger.json().get("snapshot_id")
-        if not snapshot_id:
-            raise DiscoveryError(f"No snapshot_id in trigger response: {trigger.text[:300]}")
-        print(f"[discover] snapshot_id={snapshot_id}; polling...")
+        query = _build_query(filters)
+        print(f"[discover] SERP query: {query}")
+        urls = self._serp_collect_profile_urls(query, pool_size)
+        print(f"[discover] harvested {len(urls)} unique LinkedIn profile URLs")
+        if not urls:
+            return []
 
-        records = self._poll_and_retrieve(snapshot_id)
+        urls = urls[:pool_size]
+        print(f"[discover] scraping {len(urls)} profiles (collect-by-URL)...")
+        records = self._scrape_sync(urls)
         candidates = [_record_to_candidate(r) for r in records if r]
         candidates = [c for c in candidates if c.url_key]
         print(f"[discover] retrieved {len(records)} records -> {len(candidates)} usable candidates")
         return candidates[:pool_size]
 
+    # ---------------------------------------------------------- SERP (stage 1)
+    def _serp_collect_profile_urls(self, query: str, pool_size: int) -> list[str]:
+        collected: list[str] = []
+        seen: set[str] = set()
+        for page in range(MAX_SERP_PAGES):
+            start = page * SERP_PAGE_SIZE
+            serp = self._serp_page(query, start)
+            links = _extract_profile_urls(serp)
+            new = 0
+            for link in links:
+                key = normalize_url(link)
+                if not key or "linkedin.com/in/" not in key or key in seen:
+                    continue
+                seen.add(key)
+                collected.append(link)
+                new += 1
+            print(f"[serp] page {page + 1}: +{new} new profile URLs (total {len(collected)})")
+            if len(collected) >= pool_size or new == 0:
+                break
+        return collected
+
+    def _serp_page(self, query: str, start: int) -> dict[str, Any]:
+        google_url = (
+            "https://www.google.com/search?"
+            f"q={quote_plus(query)}&num={SERP_PAGE_SIZE}&start={start}&brd_json=1"
+        )
+        payload = {"zone": self._serp_zone, "url": google_url, "format": "raw"}
+        resp = self._session.post(REQUEST_URL, json=payload, timeout=90)
+        if resp.status_code == 401:
+            raise DiscoveryError("Bright Data SERP request rejected (401). Check token / SERP zone.")
+        resp.raise_for_status()
+        # With brd_json=1 the body is Bright Data's parsed SERP JSON.
+        try:
+            return resp.json()
+        except json.JSONDecodeError:
+            try:
+                return json.loads(resp.text)
+            except json.JSONDecodeError as exc:
+                raise DiscoveryError(
+                    "SERP response was not JSON. Confirm brd_json=1 is honored for "
+                    f"your SERP zone. First 300 chars: {resp.text[:300]}"
+                ) from exc
+
+    # -------------------------------------------------------- scrape (stage 2)
+    def _scrape_sync(self, urls: list[str]) -> list[dict[str, Any]]:
+        """Sync /scrape the given URLs in chunks; aggregate records."""
+        out: list[dict[str, Any]] = []
+        for i in range(0, len(urls), SCRAPE_CHUNK):
+            chunk = urls[i : i + SCRAPE_CHUNK]
+            payload = {
+                "input": [{"url": u} for u in chunk],
+                "limit_per_input": None,
+            }
+            resp = self._session.post(
+                SCRAPE_URL,
+                params={
+                    "dataset_id": self._dataset_id,
+                    "notify": "false",
+                    "include_errors": "true",
+                },
+                json=payload,
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict):
+                # Some responses wrap rows under a key; be permissive.
+                data = data.get("data") or data.get("records") or []
+            if isinstance(data, list):
+                out.extend(r for r in data if isinstance(r, dict))
+            if len(urls) > SCRAPE_CHUNK:
+                print(f"[scrape] {min(i + SCRAPE_CHUNK, len(urls))}/{len(urls)} profiles done")
+                time.sleep(1)  # be gentle between chunks
+        return out
+
     # -------------------------------------------------------------- helpers
     def _guard_cost(self, pool_size: int) -> None:
-        estimate = pool_size * PROFILE_COST_PER_RECORD
+        # Cost ~= profiles scraped + a handful of SERP pages.
+        est_pages = min(MAX_SERP_PAGES, max(1, pool_size // 10 + 1))
+        estimate = pool_size * PROFILE_COST_PER_RECORD + est_pages * SERP_COST_PER_REQUEST
         print(
-            f"[cost] estimated discovery cost: ${estimate:.4f} "
-            f"({pool_size} records x ${PROFILE_COST_PER_RECORD}/record)"
+            f"[cost] estimated run cost: ${estimate:.4f} "
+            f"({pool_size} profiles x ${PROFILE_COST_PER_RECORD} + "
+            f"~{est_pages} SERP pages x ${SERP_COST_PER_REQUEST})"
         )
         if estimate > self._config.cost_ceiling_usd:
             raise CostCeilingExceeded(
@@ -136,75 +210,37 @@ class BrightDataClient:
                 f"${self._config.cost_ceiling_usd:.2f}. Lower POOL_SIZE or raise COST_CEILING_USD."
             )
 
-    def _poll_and_retrieve(self, snapshot_id: str) -> list[dict[str, Any]]:
-        deadline = time.monotonic() + POLL_MAX_WAIT_SECONDS
-        while True:
-            progress = self._session.get(
-                f"{BASE}/progress/{snapshot_id}", timeout=30
-            )
-            progress.raise_for_status()
-            status = progress.json().get("status")
-            if status == "ready":
-                break
-            if status == "failed":
-                raise DiscoveryError(f"Bright Data job {snapshot_id} failed.")
-            if time.monotonic() > deadline:
-                raise DiscoveryError(
-                    f"Bright Data job {snapshot_id} not ready after "
-                    f"{POLL_MAX_WAIT_SECONDS}s (last status: {status})."
-                )
-            time.sleep(POLL_INTERVAL_SECONDS)
 
-        snapshot = self._session.get(
-            f"{BASE}/snapshot/{snapshot_id}",
-            params={"format": "json"},
-            timeout=120,
-        )
-        snapshot.raise_for_status()
-        data = snapshot.json()
-        # The snapshot endpoint returns a JSON array of records.
-        if isinstance(data, dict):
-            data = data.get("data", []) or data.get("records", [])
-        return data if isinstance(data, list) else []
+# --- Google query construction ---------------------------------------------
+def _build_query(filters: ConfirmedFilters) -> str:
+    parts = ["site:linkedin.com/in/"]
+    if filters.titles:
+        titles = " OR ".join(f'"{t}"' for t in filters.titles)
+        parts.append(f"({titles})")
+    for kw in filters.keywords:
+        parts.append(f'"{kw}"' if " " in kw else kw)
+    if filters.locations:
+        # A single location term reads best in a Google query.
+        parts.append(f'"{filters.locations[0]}"')
+    return " ".join(parts)
 
 
-# --- Discovery payload shape (CONFIRM AGAINST LIVE DOCS) --------------------
-#
-# TODO(brightdata): Confirm the exact `discover_by` value and request body for
-# the LinkedIn *profiles* dataset against docs.brightdata.com. As of writing,
-# discovery on the profiles dataset is commonly driven by a keyword/role/location
-# search. The skeleton below sends one discovery object built from the confirmed
-# filters. If the dashboard shows a different field set (e.g. `search_keywords`,
-# `job_title`, `location`), adjust the keys here only — the rest of the client
-# does not depend on this shape.
-_DISCOVER_BY = "keyword"  # TODO: confirm (e.g. "keyword" | "name" | ...)
+# --- SERP result parsing ----------------------------------------------------
+def _extract_profile_urls(serp: dict[str, Any]) -> list[str]:
+    """Pull LinkedIn /in/ URLs from a Bright Data parsed-SERP JSON object."""
+    links: list[str] = []
+    organic = serp.get("organic")
+    if isinstance(organic, list):
+        for item in organic:
+            if not isinstance(item, dict):
+                continue
+            link = item.get("link") or item.get("url") or item.get("href")
+            if isinstance(link, str) and "linkedin.com/in/" in link.lower():
+                links.append(link)
+    return links
 
 
-def _build_discovery_payload(
-    filters: ConfirmedFilters, pool_size: int
-) -> list[dict[str, Any]]:
-    keyword = " ".join(
-        part
-        for part in (
-            " ".join(filters.titles),
-            " ".join(filters.keywords),
-        )
-        if part
-    ).strip()
-    location = filters.locations[0] if filters.locations else ""
-
-    # One discovery request object. Bright Data accepts an array of these.
-    return [
-        {
-            # TODO(brightdata): confirm these field names for the profiles dataset.
-            "keyword": keyword,
-            "location": location,
-            "limit": pool_size,
-        }
-    ]
-
-
-# --- Record normalization --------------------------------------------------
+# --- Record normalization ---------------------------------------------------
 def _first(record: dict[str, Any], *keys: str, default: str = "") -> str:
     for key in keys:
         val = record.get(key)
@@ -216,8 +252,8 @@ def _first(record: dict[str, Any], *keys: str, default: str = "") -> str:
 def _record_to_candidate(record: dict[str, Any]) -> Candidate:
     """Normalize a Bright Data profile record into a `Candidate`.
 
-    Bright Data field names vary slightly by dataset version; we accept the
-    common aliases for each field and keep the raw record for debugging.
+    Field names vary slightly by dataset version; accept common aliases and
+    keep the raw record for debugging.
     """
     experience = record.get("experience")
     if not isinstance(experience, list):
