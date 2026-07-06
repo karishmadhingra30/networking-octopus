@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Iterable
 
 import gspread
+from gspread.utils import rowcol_to_a1
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -90,17 +91,28 @@ class SheetClient:
 
     # ------------------------------------------------------------- init
     def ensure_header(self) -> bool:
-        """Create the header row if missing. Returns True if it was written."""
+        """Create the header row if missing. Returns True if it was written.
+
+        Always (re)applies header formatting — bold text, frozen first row — so
+        sheets created before formatting existed get upgraded on the next run.
+        """
         existing = self._ws.row_values(1)
-        if existing[: len(HEADERS)] == HEADERS:
-            return False
-        if any(cell.strip() for cell in existing):
-            raise SheetsError(
-                "Row 1 has unexpected content and does not match the expected "
-                f"header. Expected: {HEADERS}. Found: {existing}"
-            )
-        self._ws.update("A1", [HEADERS])
-        return True
+        created = False
+        if existing[: len(HEADERS)] != HEADERS:
+            if any(cell.strip() for cell in existing):
+                raise SheetsError(
+                    "Row 1 has unexpected content and does not match the expected "
+                    f"header. Expected: {HEADERS}. Found: {existing}"
+                )
+            self._ws.update("A1", [HEADERS])
+            created = True
+        self._format_header()
+        return created
+
+    def _format_header(self) -> None:
+        header_range = f"A1:{rowcol_to_a1(1, len(HEADERS))}"
+        self._ws.format(header_range, {"textFormat": {"bold": True}})
+        self._ws.freeze(rows=1)
 
     @property
     def title(self) -> str:
