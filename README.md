@@ -75,9 +75,8 @@ authenticate. The resulting token is cached at `GOOGLE_TOKEN_CACHE`
 
 ## 4. Bright Data setup
 
-1. In the Bright Data dashboard, get your **API token**.
-2. Find the **LinkedIn profiles dataset id** and copy it into
-   `BRIGHTDATA_PROFILE_DATASET_ID`.
+1. In the Bright Data dashboard, get your **API token** (Account settings).
+2. Setup SERP API and #TODO
 3. Note the free tier: **5,000 records/month**.
 
 > **Before your first real discovery run**, confirm the discovery request shape
